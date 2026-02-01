@@ -8,7 +8,7 @@ This project builds a classification model that takes historical Premier League 
 
 The predictor offers two main features:
 - A predicted final league table for all 20 Premier League clubs
-- An interactive match score predictor that calculates expected goals and win probabilities
+- I have also improved it by adding an interactive match score predictor that calculates expected goals and win probabilities
 
 ## How It Works
 

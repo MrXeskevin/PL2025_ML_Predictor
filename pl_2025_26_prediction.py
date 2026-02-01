@@ -71,6 +71,7 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
+from scipy.stats import poisson
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
@@ -333,6 +334,137 @@ def predict_league_table(model: Pipeline, features: pd.DataFrame) -> pd.DataFram
     return prediction_df[["predicted_rank", "team", "expected_position"]]
 
 
+def calculate_team_strengths(file_path: str) -> Dict[str, Dict[str, float]]:
+    """Calculate attack and defense strengths for each team.
+
+    Using the specific season file, compute the average home/away
+    goals and then determine each team's relative strength.
+    """
+    df = pd.read_csv(file_path)
+    df = parse_match_results(df)
+
+    avg_home_goals = df["home_goals"].mean()
+    avg_away_goals = df["away_goals"].mean()
+
+    teams = pd.concat([df["Team 1"], df["Team 2"]]).unique()
+    strengths = {}
+
+    for team in teams:
+        home_matches = df[df["Team 1"] == team]
+        away_matches = df[df["Team 2"] == team]
+
+        home_atk = home_matches["home_goals"].mean() / avg_home_goals if not home_matches.empty else 1.0
+        home_def = home_matches["away_goals"].mean() / avg_away_goals if not home_matches.empty else 1.0
+        away_atk = away_matches["away_goals"].mean() / avg_away_goals if not away_matches.empty else 1.0
+        away_def = away_matches["home_goals"].mean() / avg_home_goals if not away_matches.empty else 1.0
+
+        strengths[team] = {
+            "home_atk": home_atk,
+            "home_def": home_def,
+            "away_atk": away_atk,
+            "away_def": away_def
+        }
+
+    # Add default/average strengths for the newly promoted teams
+    promoted = ["Leeds United", "Burnley", "Sunderland"]
+    for team in promoted:
+        if team not in strengths:
+            strengths[team] = {
+                "home_atk": 0.8,  # Slightly weaker than average
+                "home_def": 1.2,  # Slightly more goals conceded
+                "away_atk": 0.7,
+                "away_def": 1.3
+            }
+
+    return {
+        "teams": strengths,
+        "avg_home": avg_home_goals,
+        "avg_away": avg_away_goals
+    }
+
+
+def predict_match(home_team_input: str, away_team_input: str, strength_data: Dict):
+    """Predict the score and outcome probabilities for a specific match."""
+    teams_dict = strength_data["teams"]
+    team_names = list(teams_dict.keys())
+    
+    def find_team(inp: str):
+        inp_lower = inp.lower().strip()
+        # 1. Exact case-insensitive match
+        for name in team_names:
+            if name.lower() == inp_lower:
+                return name
+        
+        # 2. Match after stripping common suffixes
+        suffixes = [" united", " city", " fc", " town", " albion", " wanderers"]
+        stripped_inp = inp_lower
+        for sfx in suffixes:
+            if stripped_inp.endswith(sfx):
+                stripped_inp = stripped_inp[:-len(sfx)].strip()
+        
+        for name in team_names:
+            name_lower = name.lower()
+            if name_lower == stripped_inp:
+                return name
+            # strip suffixes from data names too (e.g. "Man City" -> "Man")
+            for sfx in suffixes:
+                if name_lower.endswith(sfx):
+                    if name_lower[:-len(sfx)].strip() == stripped_inp:
+                        return name
+        
+        # 3. Substring match
+        for name in team_names:
+            if stripped_inp in name.lower() or name.lower() in inp_lower:
+                return name
+        return None
+
+    home_team = find_team(home_team_input)
+    away_team = find_team(away_team_input)
+    
+    if not home_team or not away_team:
+        missing = []
+        if not home_team: missing.append(f"'{home_team_input}'")
+        if not away_team: missing.append(f"'{away_team_input}'")
+        return (f"Error: Team(s) {', '.join(missing)} not found.\n"
+                f"Try using names like: {', '.join(team_names[:5])}")
+
+    avg_home = strength_data["avg_home"]
+    avg_away = strength_data["avg_away"]
+
+    # Calculate expected goals (lambda) for each team
+    home_exp = teams_dict[home_team]["home_atk"] * teams_dict[away_team]["away_def"] * avg_home
+    away_exp = teams_dict[away_team]["away_atk"] * teams_dict[home_team]["home_def"] * avg_away
+
+    # Most likely score is the rounded expected goals
+    pred_home_goals = int(round(home_exp))
+    pred_away_goals = int(round(away_exp))
+
+    # Calculate win/draw/loss probabilities using Poisson
+    prob_home_win = 0
+    prob_draw = 0
+    prob_away_win = 0
+
+    for i in range(11):
+        for j in range(11):
+            prob = poisson.pmf(i, home_exp) * poisson.pmf(j, away_exp)
+            if i > j:
+                prob_home_win += prob
+            elif i < j:
+                prob_away_win += prob
+            else:
+                prob_draw += prob
+
+    return {
+        "match": f"{home_team} vs {away_team}",
+        "predicted_score": f"{pred_home_goals} - {pred_away_goals}",
+        "home_win_pr": prob_home_win,
+        "draw_pr": prob_draw,
+        "away_win_pr": prob_away_win,
+        "exp_home": home_exp,
+        "exp_away": away_exp
+    }
+
+
 def main():
     # define the season files in chronological order
     season_files = [
@@ -349,17 +481,42 @@ def main():
     model = build_and_train_model(X_train, y_train)
     # predict ranking for 2025/26
     predictions = predict_league_table(model, latest_features)
-    # keep only the top 20 teams based on expected position.  In reality
-    # the Premier League contains exactly 20 clubs.  Since we may
-    # include extra promoted teams due to unavailable data for the
-    # intermediate 2024/25 season, truncate to 20.
+    # keep only the top 20 teams based on expected position.
     predictions = predictions.iloc[:20].copy()
-    print("Predicted Premier League 2025/26 table (1 = champion):")
+
+    print("\n" + "="*50)
+    print("PREDICTED PREMIER LEAGUE 2025/26 TABLE")
+    print("="*50)
     for _, row in predictions.iterrows():
         print(
-            f"{int(row['predicted_rank'])}. {row['team']} "
-            f"(expected pos {row['expected_position']:.2f})"
+            f"{int(row['predicted_rank']):<2} {row['team']:<18} "
+            f"(Expected Pos: {row['expected_position']:.2f})"
         )
+
+    # MATCH PREDICTION INTERACTION
+    strength_data = calculate_team_strengths(season_files[-1])
+
+    print("\n" + "="*50)
+    print("MATCH SCORE PREDICTOR")
+    print("="*50)
+    print("Enter two teams to predict their scoreline (or 'q' to quit).")
+    print(f"Available teams include: {', '.join(sorted(strength_data['teams'].keys())[:5])}...")
+
+    while True:
+        home = input("\nHome Team: ").strip()
+        if home.lower() == 'q': break
+        away = input("Away Team: ").strip()
+        if away.lower() == 'q': break
+
+        res = predict_match(home, away, strength_data)
+        if isinstance(res, str):
+            print(res)
+        else:
+            print(f"\nPrediction for {res['match']}:")
+            print(f"Most Likely Score: {res['predicted_score']}")
+            print(f"xG: {res['exp_home']:.2f} - {res['exp_away']:.2f}")
+            print(f"Probabilities: Home Win {res['home_win_pr']:.1%}, "
+                  f"Draw {res['draw_pr']:.1%}, Away Win {res['away_win_pr']:.1%}")
 
 
 if __name__ == "__main__":
